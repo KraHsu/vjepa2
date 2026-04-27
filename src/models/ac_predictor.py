@@ -108,7 +108,9 @@ class VisionTransformerPredictorAC(nn.Module):
 
         attn_mask = None
         if self.is_frame_causal:
-            grid_depth = self.num_frames // self.tubelet_size
+            # grid_depth must match the number of per-frame token groups produced by forward_target,
+            # which processes each frame independently (tubelet_size=1 effective), so use num_frames directly.
+            grid_depth = self.num_frames
             grid_height = self.img_height // self.patch_size
             grid_width = self.img_width // self.patch_size
             attn_mask = build_action_block_causal_attention_mask(

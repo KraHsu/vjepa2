@@ -1,0 +1,74 @@
+app: vjepa_lerobot
+
+nodes: 1
+tasks_per_node: 8
+cpus_per_task: 8
+mem_per_gpu: 80G
+
+folder: /mnt/cpfs/zch/vjepa2_finetune/lerobot-vitg-256px-8f
+
+meta:
+  dtype: bfloat16
+  # Fine-tune from base V-JEPA 2 encoder (no AC predictor in this checkpoint)
+  pretrain_checkpoint: /mnt/cpfs/zch/vjepa2_pretrain/vitg.pt
+  # vitg.pt is a pure pretraining checkpoint; encoder key is "encoder" or "target_encoder"
+  context_encoder_key: target_encoder
+  target_encoder_key: target_encoder
+  # No AC predictor in base checkpoint, always train from scratch
+  load_predictor: false
+  load_encoder: true
+  use_sdpa: true
+
+model:
+  model_name: vit_giant_xformers
+  pred_depth: 24
+  pred_embed_dim: 1024
+  pred_num_heads: 16
+  pred_is_frame_causal: true
+  use_rope: true
+  use_activation_checkpointing: true
+  use_extrinsics: false
+  action_embed_dim: 102
+  state_embed_dim: 102
+
+data:
+  data_root: /mnt/cpfs/ego_pretrain/lerobot
+  datasets:
+    - lerobot_ego4d_cooking
+    - lerobot_egoexo4d
+  batch_size: 64
+  frames_per_clip: 8
+  tubelet_size: 2
+  fps: 30
+  crop_size: 256
+  patch_size: 16
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: true
+
+data_aug:
+  horizontal_flip: false
+  random_resize_scale: [1.0, 1.0]
+  random_resize_aspect_ratio: [0.75, 1.33]
+  auto_augment: false
+  motion_shift: false
+  reprob: 0.0
+
+loss:
+  auto_steps: 2
+  loss_exp: 1.0
+  normalize_reps: true
+
+optimization:
+  epochs: 100
+  ipe: 500
+  warmup: 5
+  anneal: 10
+  lr: 0.000200
+  start_lr: 0.000020
+  final_lr: 0.0
+  weight_decay: 0.04
+  final_weight_decay: 0.04
+  enc_lr_scale: 0.1
+  betas: [0.9, 0.999]
+  eps: 1.0e-8

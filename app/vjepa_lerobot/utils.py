@@ -203,7 +203,7 @@ def init_opt(
     wd=1e-6,
     final_wd=1e-6,
     final_lr=0.0,
-    mixed_precision=False,
+    use_scaler=False,
     betas=(0.9, 0.999),
     eps=1e-8,
     zero_init_bias_wd=True,
@@ -246,5 +246,8 @@ def init_opt(
         final_wd=final_wd,
         T_max=int(num_epochs * iterations_per_epoch),
     )
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
+    # GradScaler is meaningful only for fp16. bf16 has the same dynamic range as
+    # fp32 so dynamic loss scaling does nothing useful (and the scale grows
+    # unboundedly until it saturates).
+    scaler = torch.amp.GradScaler("cuda") if use_scaler else None
     return optimizer, scaler, scheduler, wd_scheduler

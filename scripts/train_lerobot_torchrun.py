@@ -22,7 +22,6 @@ import argparse
 import logging
 import pprint
 
-import torch
 import torch.distributed as dist
 import yaml
 
@@ -45,9 +44,11 @@ def main():
 
     logger.info(f"rank={rank}/{world_size}  local_rank={_local_rank}")
 
-    # Each process sees exactly one GPU (cuda:0 == physical GPU _local_rank)
+    # Each process sees exactly one GPU (cuda:0 == physical GPU _local_rank).
+    # device_id accepts int or torch.device on recent PyTorch; int is the
+    # broader-compatible form.
     dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank,
-                            device_id=torch.device("cuda:0"))
+                            device_id=0)
 
     # Load config
     with open(args.fname, "r") as f:

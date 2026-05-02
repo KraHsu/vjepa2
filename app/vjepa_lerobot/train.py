@@ -74,6 +74,10 @@ def main(args, resume_preempt=False):
     else:
         dtype = torch.float32
         mixed_precision = False
+    # Loss scaling is only useful for fp16. bf16 keeps the fp32 dynamic range,
+    # so a GradScaler would just multiply/divide by a constant 2^16 and grow
+    # the scale until it saturates with no benefit.
+    use_scaler = (dtype == torch.float16)
 
     # -- MODEL
     cfgs_model = args.get("model")
@@ -261,13 +265,15 @@ def main(args, resume_preempt=False):
         anneal=anneal,
         warmup=warmup,
         num_epochs=num_epochs,
-        mixed_precision=mixed_precision,
+        use_scaler=use_scaler,
         betas=betas,
         eps=eps,
     )
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
-    target_encoder = DistributedDataParallel(target_encoder)
+    # target_encoder is fully frozen and loaded identically on every rank from
+    # the same pretrain checkpoint, so DDP wrapping would only add forward-pass
+    # hook overhead with no gradient/buffer sync to do.
     for p in target_encoder.parameters():
         p.requires_grad = False
 
@@ -317,7 +323,11 @@ def main(args, resume_preempt=False):
             logger.info(f"Encountered exception when saving checkpoint: {e}")
 
     logger.info("Initializing loader...")
-    unsupervised_sampler.set_epoch(start_epoch)
+    # Monotonically incrementing seed for DistributedSampler: any time we
+    # rebuild the loader (epoch boundary OR mid-epoch StopIteration OR mid-skip
+    # exhaustion) we bump this so shuffle order keeps changing.
+    sampler_step = start_epoch
+    unsupervised_sampler.set_epoch(sampler_step)
     loader = iter(unsupervised_loader)
 
     if skip_batches > 0:
@@ -328,6 +338,8 @@ def main(args, resume_preempt=False):
             try:
                 _ = next(loader)
             except Exception:
+                sampler_step += 1
+                unsupervised_sampler.set_epoch(sampler_step)
                 loader = iter(unsupervised_loader)
                 _ = next(loader)
 
@@ -358,7 +370,8 @@ def main(args, resume_preempt=False):
                     iter_successful = True
                 except StopIteration:
                     logger.info("Exhausted data loaders. Refreshing...")
-                    unsupervised_sampler.set_epoch(epoch)
+                    sampler_step += 1
+                    unsupervised_sampler.set_epoch(sampler_step)
                     loader = iter(unsupervised_loader)
                 except Exception as e:
                     NUM_RETRIES = 5
@@ -421,7 +434,7 @@ def main(args, resume_preempt=False):
                     _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
                     return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
 
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
                     # Target features (frozen, EMA-updated): provide the learning signal.
                     h = featurize(target_encoder, clips, with_grad=False)
                     # Context features (the encoder we are training): predictor input.
@@ -431,12 +444,12 @@ def main(args, resume_preempt=False):
                     sloss = loss_fn(z_ar, h)
                     loss = jloss + sloss
 
-                if mixed_precision:
+                if use_scaler:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                 else:
                     loss.backward()
-                if mixed_precision:
+                if use_scaler:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
@@ -448,7 +461,7 @@ def main(args, resume_preempt=False):
                 # to make action-conditioned predictions match these frozen target
                 # features. Without this anchor (e.g. with EMA target) and without
                 # masking, the encoder can collapse to direction-degenerate features.
-                return float(loss), float(jloss), float(sloss), _new_lr, _new_wd
+                return loss.detach().item(), jloss.detach().item(), sloss.detach().item(), _new_lr, _new_wd
 
             (loss, jloss, sloss, _new_lr, _new_wd), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0

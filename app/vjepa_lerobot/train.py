@@ -10,6 +10,7 @@ try:
 except Exception:
     pass
 
+import contextlib
 import copy
 import gc
 import random
@@ -381,11 +382,18 @@ def main(args, resume_preempt=False):
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
 
-                def forward_target(c):
-                    with torch.no_grad():
-                        c = c.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
-                        h = target_encoder(c)
-                        h = h.view(batch_size, max_num_frames, -1, h.size(-1)).flatten(1, 2)
+                def featurize(net, c, with_grad):
+                    # c: [B, C, T, H, W]. Run encoder once on the full clip (tubelet=2
+                    # produces T/2 temporal tokens), then repeat_interleave the temporal
+                    # axis so the output matches the predictor's per-frame layout
+                    # [B, T * tokens_per_frame, D]. Frames within the same tubelet pair
+                    # share identical features (same as feeding (frame, frame) tubelets).
+                    grad_ctx = contextlib.nullcontext() if with_grad else torch.no_grad()
+                    with grad_ctx:
+                        h = net(c)  # [B, (T/tubelet)*tokens_per_frame, D]
+                        h = h.view(batch_size, max_num_frames // tubelet_size, -1, h.size(-1))
+                        h = h.repeat_interleave(tubelet_size, dim=1)  # [B, T, tokens_per_frame, D]
+                        h = h.flatten(1, 2)
                         if normalize_reps:
                             h = F.layer_norm(h, (h.size(-1),))
                         return h
@@ -414,8 +422,11 @@ def main(args, resume_preempt=False):
                     return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
 
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h = forward_target(clips)
-                    z_tf, z_ar = forward_predictions(h)
+                    # Target features (frozen, EMA-updated): provide the learning signal.
+                    h = featurize(target_encoder, clips, with_grad=False)
+                    # Context features (the encoder we are training): predictor input.
+                    z = featurize(encoder, clips, with_grad=True)
+                    z_tf, z_ar = forward_predictions(z)
                     jloss = loss_fn(z_tf, h)
                     sloss = loss_fn(z_ar, h)
                     loss = jloss + sloss
@@ -432,6 +443,11 @@ def main(args, resume_preempt=False):
                     optimizer.step()
                 optimizer.zero_grad()
 
+                # target_encoder is held FROZEN at the pretrain weights (no EMA, no
+                # grad). It serves as a fixed anchor: encoder + predictor are trained
+                # to make action-conditioned predictions match these frozen target
+                # features. Without this anchor (e.g. with EMA target) and without
+                # masking, the encoder can collapse to direction-degenerate features.
                 return float(loss), float(jloss), float(sloss), _new_lr, _new_wd
 
             (loss, jloss, sloss, _new_lr, _new_wd), gpu_etime_ms = gpu_timer(train_step)

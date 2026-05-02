@@ -146,8 +146,12 @@ class LeRobotVideoDataset(torch.utils.data.Dataset):
         df = pd.read_parquet(parquet_path)
         n_frames_total = len(df)
 
-        # -- load video
-        vr = VideoReader(video_path, num_threads=-1, ctx=cpu(0))
+        # -- load video.
+        # num_threads=1: with N=num_workers DataLoader processes per GPU and 8 GPUs/node,
+        # each VideoReader spawning all-CPU threads (num_threads=-1) causes severe
+        # oversubscription on shared 128-core nodes. One thread per worker is plenty
+        # since each clip is short.
+        vr = VideoReader(video_path, num_threads=1, ctx=cpu(0))
         vfps = vr.get_avg_fps()
         fpc = self.frames_per_clip
         target_fps = self.fps if self.fps is not None else vfps
@@ -174,8 +178,9 @@ class LeRobotVideoDataset(torch.utils.data.Dataset):
         parquet_indices = np.clip(indices, 0, n_frames_total - 1)
         T_sub = len(parquet_indices)  # == frames_per_clip
 
-        actions_raw = np.stack([np.array(df["action"].iloc[i]) for i in parquet_indices])  # [T, D_a]
-        states_raw = np.stack([np.array(df["state"].iloc[i]) for i in parquet_indices])    # [T, D_s]
+        # Vectorized fetch: avoid per-row pandas iloc + np.array, which is ~10x slower.
+        actions_raw = np.stack(df["action"].to_numpy()[parquet_indices])  # [T, D_a]
+        states_raw = np.stack(df["state"].to_numpy()[parquet_indices])    # [T, D_s]
 
         # Slice / pad to target dims.
         # ac_predictor uses action_embed_dim for both action and state encoders,

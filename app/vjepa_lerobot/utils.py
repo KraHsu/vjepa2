@@ -17,6 +17,60 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
 
+def _unwrap(m):
+    """Return the underlying module if wrapped in DDP/FSDP, else m itself."""
+    return m.module if (m is not None and hasattr(m, "module")) else m
+
+
+def _strip_pretrain_prefixes(state):
+    """Strip wrapper prefixes from a pretrain state_dict.
+
+    Pretrain checkpoints can use any of `module.`, `backbone.`, or `module.backbone.`
+    depending on how they were trained/saved. We normalize to bare param names
+    (`patch_embed.proj.weight`, ...) to match an unwrapped raw nn.Module.
+    """
+    out = {}
+    for k, v in state.items():
+        nk = k
+        # Repeatedly peel off either prefix in any order until neither is present.
+        for _ in range(2):
+            if nk.startswith("module."):
+                nk = nk[len("module.") :]
+            if nk.startswith("backbone."):
+                nk = nk[len("backbone.") :]
+        out[nk] = v
+    return out
+
+
+def _load_into(name, ddp_or_module, state, epoch):
+    """Strict-aware load with explicit miss reporting.
+
+    Loads into `_unwrap(...)` so the destination keys are bare (no `module.`),
+    matching the stripped state_dict. Logs match counts so silent prefix mismatches
+    can never go unnoticed again.
+    """
+    raw = _unwrap(ddp_or_module)
+    stripped = _strip_pretrain_prefixes(state)
+    dst_keys = set(raw.state_dict().keys())
+    src_keys = set(stripped.keys())
+    matched = dst_keys & src_keys
+    if len(matched) == 0:
+        sample_dst = sorted(dst_keys)[:2]
+        sample_src = sorted(src_keys)[:2]
+        raise RuntimeError(
+            f"load_pretrained({name}): 0/{len(dst_keys)} keys matched. "
+            f"Pretrain prefix stripping failed.\n"
+            f"  dst sample: {sample_dst}\n"
+            f"  src sample: {sample_src}"
+        )
+    msg = raw.load_state_dict(stripped, strict=False)
+    logger.info(
+        f"loaded pretrained {name} from epoch {epoch}: "
+        f"matched={len(matched)}/{len(dst_keys)}, "
+        f"missing={len(msg.missing_keys)}, unexpected={len(msg.unexpected_keys)}"
+    )
+
+
 def load_pretrained(
     r_path,
     encoder=None,
@@ -32,22 +86,13 @@ def load_pretrained(
     epoch = checkpoint["epoch"]
 
     if load_encoder:
-        pretrained_dict = checkpoint[context_encoder_key]
-        pretrained_dict = {k.replace("backbone.", "").replace("module.", ""): v for k, v in pretrained_dict.items()}
-        msg = encoder.load_state_dict(pretrained_dict, strict=False)
-        logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
+        _load_into("encoder", encoder, checkpoint[context_encoder_key], epoch)
 
     if load_predictor:
-        pretrained_dict = checkpoint["predictor"]
-        pretrained_dict = {k.replace("backbone.", "").replace("module.", ""): v for k, v in pretrained_dict.items()}
-        msg = predictor.load_state_dict(pretrained_dict, strict=False)
-        logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
+        _load_into("predictor", predictor, checkpoint["predictor"], epoch)
 
     if load_encoder and target_encoder is not None:
-        pretrained_dict = checkpoint[target_encoder_key]
-        pretrained_dict = {k.replace("backbone.", "").replace("module.", ""): v for k, v in pretrained_dict.items()}
-        msg = target_encoder.load_state_dict(pretrained_dict, strict=False)
-        logger.info(f"loaded pretrained target_encoder from epoch {epoch} with msg: {msg}")
+        _load_into("target_encoder", target_encoder, checkpoint[target_encoder_key], epoch)
 
     del checkpoint
     return encoder, predictor, target_encoder
@@ -60,7 +105,6 @@ def load_checkpoint(
     target_encoder,
     opt=None,
     scaler=None,
-    replace_kw=["backbone.", "module."],
 ):
     logger.info(f"Loading checkpoint from {r_path}")
     checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
@@ -69,15 +113,11 @@ def load_checkpoint(
     for key, model in [("encoder", encoder), ("predictor", predictor), ("target_encoder", target_encoder)]:
         if model is None:
             continue
-        d = checkpoint[key]
-        for kw in replace_kw:
-            d = {k.replace(kw, ""): v for k, v in d.items()}
-        msg = model.load_state_dict(d, strict=False)
-        logger.info(f"loaded {key} from epoch {epoch} with msg: {msg}")
+        _load_into(key, model, checkpoint[key], epoch)
 
     if opt is not None:
         opt.load_state_dict(checkpoint["opt"])
-    if scaler is not None:
+    if scaler is not None and checkpoint.get("scaler") is not None:
         scaler.load_state_dict(checkpoint["scaler"])
 
     logger.info(f"loaded optimizers from epoch {epoch}")

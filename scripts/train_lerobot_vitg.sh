@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Train lerobot ViT-g/16 (256px, 8 frames)
 #
-# Local (all GPUs auto-detected):
+# ── Local (all GPUs auto-detected) ──
 #   bash scripts/train_lerobot_vitg.sh
 #
-# Local with WandB:
+# ── Local with WandB ──
 #   WANDB_API_KEY=xxx bash scripts/train_lerobot_vitg.sh
 #
-# SLURM distributed (via submitit):
+# ── DLC / multi-node (env vars injected by scheduler) ──
+#   NNODES=2 NODE_RANK=0 MASTER_ADDR=10.0.0.1 bash scripts/train_lerobot_vitg.sh
+#   NNODES=2 NODE_RANK=1 MASTER_ADDR=10.0.0.1 bash scripts/train_lerobot_vitg.sh
+#
+# ── SLURM distributed (via submitit) ──
 #   bash scripts/train_lerobot_vitg.sh --distributed --account my_account --partition learn
 #
 # Override config:
@@ -33,15 +37,24 @@ if $DISTRIBUTED; then
         --fname "${CONFIG}" \
         "${EXTRA_ARGS[@]}"
 else
-    NGPUS=$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)
-    NGPUS="${NGPUS:-1}"
-    DEVICES=""
-    for i in $(seq 0 $((NGPUS - 1))); do
-        DEVICES="$DEVICES cuda:$i"
-    done
-    echo "Launching locally on ${NGPUS} GPU(s): ${DEVICES}"
-    python -m app.main \
+    # ── GPU / Node topology (compatible with DLC and local runs) ──
+    NPROC_PER_NODE="${NPROC_PER_NODE:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
+    NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+    NNODES="${NNODES:-${WORLD_SIZE:-1}}"
+    NODE_RANK="${NODE_RANK:-${RANK:-0}}"
+    MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+    MASTER_PORT="${MASTER_PORT:-29500}"
+
+    echo "Launching on ${NNODES} node(s), ${NPROC_PER_NODE} GPU(s)/node, node rank ${NODE_RANK}"
+    echo "Master: ${MASTER_ADDR}:${MASTER_PORT}"
+
+    torchrun \
+        --nnodes "${NNODES}" \
+        --nproc_per_node "${NPROC_PER_NODE}" \
+        --node_rank "${NODE_RANK}" \
+        --master_addr "${MASTER_ADDR}" \
+        --master_port "${MASTER_PORT}" \
+        scripts/train_lerobot_torchrun.py \
         --fname "${CONFIG}" \
-        --devices ${DEVICES} \
         "${EXTRA_ARGS[@]}"
 fi

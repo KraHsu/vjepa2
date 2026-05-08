@@ -66,6 +66,21 @@ loss:
   loss_exp: 1.0
   normalize_reps: true
 
+train_control:
+  # Method controls for matrix experiments. target_update=fixed restores the
+  # previous frozen-target behavior; ema follows standard JEPA momentum targets.
+  target_update: ema
+  ema: [0.996, 1.0]
+  predictor_warmup_steps: 0
+  freeze_encoder_during_predictor_warmup: true
+  pause_ema_during_predictor_warmup: true
+  log_detailed_wandb: true
+  detailed_log_freq: 10
+  log_grad_norms: true
+  log_param_norms: true
+  log_latent_stats: true
+  log_input_stats: true
+
 optimization:
   epochs: 100
   ipe: 500

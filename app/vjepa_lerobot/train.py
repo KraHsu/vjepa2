@@ -33,7 +33,7 @@ from app.vjepa_droid.transforms import make_transforms
 from app.vjepa_lerobot.lerobot_dataset import init_data
 from app.vjepa_lerobot.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
 from src.utils.distributed import init_distributed
-from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
+from src.utils.logging import AverageMeter, get_logger, gpu_timer
 
 log_timings = True
 log_freq = 10
@@ -47,6 +47,82 @@ torch.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True
 
 logger = get_logger(__name__, force=True)
+STATS_MAX_ELEMENTS = 1_000_000
+
+
+def _unwrap(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _sample_flat(tensor, max_elements=STATS_MAX_ELEMENTS):
+    flat = tensor.detach().flatten()
+    if flat.numel() > max_elements:
+        stride = int(np.ceil(flat.numel() / max_elements))
+        flat = flat[::stride][:max_elements]
+    return flat.float()
+
+
+def _sample_flat_pair(a, b, max_elements=STATS_MAX_ELEMENTS):
+    a_flat = a.detach().flatten()
+    b_flat = b.detach().flatten()
+    if a_flat.numel() > max_elements:
+        stride = int(np.ceil(a_flat.numel() / max_elements))
+        a_flat = a_flat[::stride][:max_elements]
+        b_flat = b_flat[::stride][:max_elements]
+    return a_flat.float(), b_flat.float()
+
+
+def _tensor_stats(prefix, tensor):
+    t = _sample_flat(tensor)
+    return {
+        f"{prefix}/mean": t.mean().item(),
+        f"{prefix}/std": t.std(unbiased=False).item(),
+        f"{prefix}/norm": t.norm().item(),
+        f"{prefix}/max_abs": t.abs().max().item(),
+    }
+
+
+def _param_norm(model):
+    total = 0.0
+    with torch.no_grad():
+        for p in _unwrap(model).parameters():
+            norm = torch.linalg.vector_norm(p.detach(), dtype=torch.float32)
+            total += norm.item() ** 2
+    return total**0.5
+
+
+def _grad_norm(model):
+    total = 0.0
+    has_grad = False
+    for p in _unwrap(model).parameters():
+        if p.grad is None:
+            continue
+        has_grad = True
+        norm = torch.linalg.vector_norm(p.grad.detach(), dtype=torch.float32)
+        total += norm.item() ** 2
+    return total**0.5 if has_grad else 0.0
+
+
+def _ema_momentum(step, total_steps, ema):
+    if ema is None:
+        return None
+    start, end = float(ema[0]), float(ema[1])
+    progress = min(max(step, 0), max(1, total_steps)) / max(1, total_steps)
+    return start + progress * (end - start)
+
+
+@torch.no_grad()
+def _update_target_encoder(encoder, target_encoder, momentum):
+    params_q = [p.detach() for p in _unwrap(encoder).parameters()]
+    params_k = [p.detach() for p in _unwrap(target_encoder).parameters()]
+    torch._foreach_mul_(params_k, momentum)
+    torch._foreach_add_(params_k, params_q, alpha=1.0 - momentum)
+
+
+def _optimizer_group_lr(optimizer, group_idx):
+    if group_idx >= len(optimizer.param_groups):
+        return 0.0
+    return optimizer.param_groups[group_idx].get("lr", 0.0)
 
 
 def main(args, resume_preempt=False):
@@ -143,6 +219,26 @@ def main(args, resume_preempt=False):
     betas = cfgs_opt.get("betas", (0.9, 0.999))
     eps = cfgs_opt.get("eps", 1.0e-8)
 
+    # -- TRAIN CONTROL / DEBUGGING
+    cfgs_train_control = args.get("train_control", {})
+    target_update = cfgs_train_control.get("target_update", "ema")
+    if target_update not in ("ema", "fixed"):
+        raise ValueError(f"Unsupported train_control.target_update={target_update}")
+    ema = cfgs_train_control.get("ema", [0.996, 1.0])
+    predictor_warmup_steps = int(cfgs_train_control.get("predictor_warmup_steps", 0))
+    freeze_encoder_during_predictor_warmup = cfgs_train_control.get(
+        "freeze_encoder_during_predictor_warmup", True
+    )
+    pause_ema_during_predictor_warmup = cfgs_train_control.get(
+        "pause_ema_during_predictor_warmup", True
+    )
+    log_detailed_wandb = cfgs_train_control.get("log_detailed_wandb", True)
+    detailed_log_freq = int(cfgs_train_control.get("detailed_log_freq", log_freq))
+    log_grad_norms = cfgs_train_control.get("log_grad_norms", True)
+    log_param_norms = cfgs_train_control.get("log_param_norms", True)
+    log_latent_stats = cfgs_train_control.get("log_latent_stats", True)
+    log_input_stats = cfgs_train_control.get("log_input_stats", True)
+
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.backends.cudnn.benchmark = True
@@ -172,22 +268,10 @@ def main(args, resume_preempt=False):
         device = torch.device("cuda:0")
         torch.cuda.set_device(device)
 
-    log_file = os.path.join(folder, f"log_r{rank}.csv")
     latest_path = os.path.join(folder, "latest.pt")
     resume_path = os.path.join(folder, r_file) if r_file is not None else latest_path
     if not os.path.exists(resume_path):
         resume_path = None
-
-    csv_logger = CSVLogger(
-        log_file,
-        ("%d", "epoch"),
-        ("%d", "itr"),
-        ("%.5f", "loss"),
-        ("%d", "iter-time(ms)"),
-        ("%d", "gpu-time(ms)"),
-        ("%d", "dataload-time(ms)"),
-        mode="+a",
-    )
 
     # -- init model
     encoder, predictor = init_video_model(
@@ -269,11 +353,12 @@ def main(args, resume_preempt=False):
         betas=betas,
         eps=eps,
     )
-    encoder = DistributedDataParallel(encoder, static_graph=True)
+    encoder = DistributedDataParallel(
+        encoder,
+        static_graph=(predictor_warmup_steps <= 0),
+        find_unused_parameters=(predictor_warmup_steps > 0),
+    )
     predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
-    # target_encoder is fully frozen and loaded identically on every rank from
-    # the same pretrain checkpoint, so DDP wrapping would only add forward-pass
-    # hook overhead with no gradient/buffer sync to do.
     for p in target_encoder.parameters():
         p.requires_grad = False
 
@@ -301,6 +386,8 @@ def main(args, resume_preempt=False):
         for _ in range(start_epoch * ipe):
             scheduler.step()
             wd_scheduler.step()
+
+    total_train_steps = int(num_epochs * ipe)
 
     def save_checkpoint(epoch, path):
         if rank != 0:
@@ -392,6 +479,20 @@ def main(args, resume_preempt=False):
                 gc.collect()
 
             def train_step():
+                global_step = epoch * ipe + itr
+                step_num = global_step + 1
+                in_predictor_warmup = (
+                    freeze_encoder_during_predictor_warmup
+                    and predictor_warmup_steps > 0
+                    and global_step < predictor_warmup_steps
+                )
+                collect_detailed = (
+                    rank == 0
+                    and wandb_run is not None
+                    and log_detailed_wandb
+                    and detailed_log_freq > 0
+                    and (global_step % detailed_log_freq == 0)
+                )
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
 
@@ -435,10 +536,12 @@ def main(args, resume_preempt=False):
                     return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
 
                 with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
-                    # Target features (frozen, EMA-updated): provide the learning signal.
+                    # Target features provide the learning signal. With EMA enabled,
+                    # target_encoder follows encoder after each optimizer step.
                     h = featurize(target_encoder, clips, with_grad=False)
-                    # Context features (the encoder we are training): predictor input.
-                    z = featurize(encoder, clips, with_grad=True)
+                    # During predictor warmup, keep encoder fixed and train only
+                    # predictor on the pretrained feature space.
+                    z = featurize(encoder, clips, with_grad=not in_predictor_warmup)
                     z_tf, z_ar = forward_predictions(z)
                     jloss = loss_fn(z_tf, h)
                     sloss = loss_fn(z_ar, h)
@@ -449,21 +552,93 @@ def main(args, resume_preempt=False):
                     scaler.unscale_(optimizer)
                 else:
                     loss.backward()
+
+                detailed_stats = {}
+                if collect_detailed:
+                    if log_grad_norms:
+                        enc_grad_norm = _grad_norm(encoder)
+                        pred_grad_norm = _grad_norm(predictor)
+                        detailed_stats.update(
+                            {
+                                "grad/encoder_norm": enc_grad_norm,
+                                "grad/predictor_norm": pred_grad_norm,
+                                "grad/total_norm": (enc_grad_norm**2 + pred_grad_norm**2) ** 0.5,
+                            }
+                        )
+                    if log_latent_stats:
+                        detailed_stats.update(_tensor_stats("latent/h", h))
+                        detailed_stats.update(_tensor_stats("latent/z", z))
+                        detailed_stats.update(_tensor_stats("latent/z_tf", z_tf))
+                        detailed_stats.update(_tensor_stats("latent/z_ar", z_ar))
+                        z_det, h_det = _sample_flat_pair(z, h)
+                        detailed_stats["latent/z_h_cosine"] = F.cosine_similarity(
+                            z_det, h_det, dim=0
+                        ).item()
+                        detailed_stats["latent/z_target_l1"] = torch.mean(
+                            torch.abs(z_det - h_det)
+                        ).item()
+                    if log_input_stats:
+                        detailed_stats.update(_tensor_stats("input/clip", clips))
+                        detailed_stats.update(_tensor_stats("input/action", actions))
+                        detailed_stats.update(_tensor_stats("input/state", states))
+                        detailed_stats.update(_tensor_stats("input/extrinsics", extrinsics))
+
                 if use_scaler:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     optimizer.step()
+
+                ema_momentum = None
+                ema_updated = False
+                if target_update == "ema":
+                    ema_momentum = _ema_momentum(step_num, total_train_steps, ema)
+                    if not (pause_ema_during_predictor_warmup and in_predictor_warmup):
+                        _update_target_encoder(encoder, target_encoder, ema_momentum)
+                        ema_updated = True
+
+                if collect_detailed:
+                    detailed_stats.update(
+                        {
+                            "optim/encoder_lr": _optimizer_group_lr(optimizer, 0),
+                            "optim/predictor_lr": _optimizer_group_lr(optimizer, 1),
+                            "optim/ema_momentum": 0.0 if ema_momentum is None else ema_momentum,
+                            "train/is_predictor_warmup": float(in_predictor_warmup),
+                            "train/ema_updated": float(ema_updated),
+                        }
+                    )
+                    if log_param_norms:
+                        detailed_stats.update(
+                            {
+                                "param/encoder_norm": _param_norm(encoder),
+                                "param/predictor_norm": _param_norm(predictor),
+                                "param/target_encoder_norm": _param_norm(target_encoder),
+                            }
+                        )
+
                 optimizer.zero_grad()
 
-                # target_encoder is held FROZEN at the pretrain weights (no EMA, no
-                # grad). It serves as a fixed anchor: encoder + predictor are trained
-                # to make action-conditioned predictions match these frozen target
-                # features. Without this anchor (e.g. with EMA target) and without
-                # masking, the encoder can collapse to direction-degenerate features.
-                return loss.detach().item(), jloss.detach().item(), sloss.detach().item(), _new_lr, _new_wd
+                return (
+                    loss.detach().item(),
+                    jloss.detach().item(),
+                    sloss.detach().item(),
+                    _new_lr,
+                    _new_wd,
+                    0.0 if ema_momentum is None else ema_momentum,
+                    float(in_predictor_warmup),
+                    detailed_stats,
+                )
 
-            (loss, jloss, sloss, _new_lr, _new_wd), gpu_etime_ms = gpu_timer(train_step)
+            (
+                loss,
+                jloss,
+                sloss,
+                _new_lr,
+                _new_wd,
+                _ema_momentum,
+                _is_predictor_warmup,
+                detailed_stats,
+            ), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
             loss_meter.update(loss)
             jloss_meter.update(jloss)
@@ -473,7 +648,6 @@ def main(args, resume_preempt=False):
             data_elapsed_time_meter.update(data_elapsed_time_ms)
 
             def log_stats():
-                csv_logger.log(epoch + 1, itr, loss, iter_elapsed_time_ms, gpu_etime_ms, data_elapsed_time_ms)
                 global_step = epoch * ipe + itr
                 if rank == 0:
                     pbar.set_postfix(
@@ -489,22 +663,25 @@ def main(args, resume_preempt=False):
                         tb_writer.add_scalar("train/loss_avg", loss_meter.avg, global_step)
                         tb_writer.add_scalar("optim/lr", _new_lr, global_step)
                         tb_writer.add_scalar("optim/wd", _new_wd, global_step)
+                        tb_writer.add_scalar("optim/ema_momentum", _ema_momentum, global_step)
+                        tb_writer.add_scalar("train/is_predictor_warmup", _is_predictor_warmup, global_step)
                         tb_writer.add_scalar("perf/gpu_time_ms", gpu_etime_ms, global_step)
                         tb_writer.add_scalar("perf/mem_mb", torch.cuda.max_memory_allocated() / 1024.0**2, global_step)
                     if wandb_run is not None:
-                        wandb_run.log(
-                            {
-                                "train/loss": loss,
-                                "train/jloss": jloss,
-                                "train/sloss": sloss,
-                                "train/loss_avg": loss_meter.avg,
-                                "optim/lr": _new_lr,
-                                "optim/wd": _new_wd,
-                                "perf/gpu_time_ms": gpu_etime_ms,
-                                "perf/mem_mb": torch.cuda.max_memory_allocated() / 1024.0**2,
-                            },
-                            step=global_step,
-                        )
+                        wandb_payload = {
+                            "train/loss": loss,
+                            "train/jloss": jloss,
+                            "train/sloss": sloss,
+                            "train/loss_avg": loss_meter.avg,
+                            "train/is_predictor_warmup": _is_predictor_warmup,
+                            "optim/lr": _new_lr,
+                            "optim/wd": _new_wd,
+                            "optim/ema_momentum": _ema_momentum,
+                            "perf/gpu_time_ms": gpu_etime_ms,
+                            "perf/mem_mb": torch.cuda.max_memory_allocated() / 1024.0**2,
+                        }
+                        wandb_payload.update(detailed_stats)
+                        wandb_run.log(wandb_payload, step=global_step)
 
             log_stats()
             assert not np.isnan(loss), "loss is nan"
@@ -522,7 +699,7 @@ def main(args, resume_preempt=False):
                     "epoch/jloss_avg": jloss_meter.avg,
                     "epoch/sloss_avg": sloss_meter.avg,
                 },
-                step=epoch + 1,
+                step=(epoch + 1) * ipe - 1,
             )
         if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)

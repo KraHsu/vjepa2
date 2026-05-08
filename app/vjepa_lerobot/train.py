@@ -635,8 +635,8 @@ def main(args, resume_preempt=False):
                 sloss,
                 _new_lr,
                 _new_wd,
-                _ema_momentum,
-                _is_predictor_warmup,
+                ema_momentum_value,
+                is_predictor_warmup_value,
                 detailed_stats,
             ), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
@@ -663,8 +663,8 @@ def main(args, resume_preempt=False):
                         tb_writer.add_scalar("train/loss_avg", loss_meter.avg, global_step)
                         tb_writer.add_scalar("optim/lr", _new_lr, global_step)
                         tb_writer.add_scalar("optim/wd", _new_wd, global_step)
-                        tb_writer.add_scalar("optim/ema_momentum", _ema_momentum, global_step)
-                        tb_writer.add_scalar("train/is_predictor_warmup", _is_predictor_warmup, global_step)
+                        tb_writer.add_scalar("optim/ema_momentum", ema_momentum_value, global_step)
+                        tb_writer.add_scalar("train/is_predictor_warmup", is_predictor_warmup_value, global_step)
                         tb_writer.add_scalar("perf/gpu_time_ms", gpu_etime_ms, global_step)
                         tb_writer.add_scalar("perf/mem_mb", torch.cuda.max_memory_allocated() / 1024.0**2, global_step)
                     if wandb_run is not None:
@@ -673,10 +673,10 @@ def main(args, resume_preempt=False):
                             "train/jloss": jloss,
                             "train/sloss": sloss,
                             "train/loss_avg": loss_meter.avg,
-                            "train/is_predictor_warmup": _is_predictor_warmup,
+                            "train/is_predictor_warmup": is_predictor_warmup_value,
                             "optim/lr": _new_lr,
                             "optim/wd": _new_wd,
-                            "optim/ema_momentum": _ema_momentum,
+                            "optim/ema_momentum": ema_momentum_value,
                             "perf/gpu_time_ms": gpu_etime_ms,
                             "perf/mem_mb": torch.cuda.max_memory_allocated() / 1024.0**2,
                         }

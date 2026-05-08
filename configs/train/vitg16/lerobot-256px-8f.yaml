@@ -14,8 +14,15 @@ meta:
   pretrain_checkpoint: /mnt/cpfs/zch/vjepa2_pretrain/vjepa2-ac-vitg.pt
   context_encoder_key: target_encoder
   target_encoder_key: target_encoder
-  # Predictor from scratch: action_embed_dim=102 doesn't match AC ckpt's 7-dim weights
+  # Predictor initialization:
+  # - keep load_predictor=false to train the AC predictor from scratch.
+  # - set load_predictor=true to reuse matching predictor weights. This checkpoint
+  #   has 7-dim action/state encoders, while this config uses action_embed_dim=102,
+  #   so predictor_init_mode=shape_safe is required unless action_embed_dim is 7.
   load_predictor: false
+  predictor_key: predictor
+  predictor_init_mode: shape_safe  # strict | shape_safe
+  predictor_min_matched: 200
   load_encoder: true
   use_sdpa: true
 

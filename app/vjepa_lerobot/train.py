@@ -132,6 +132,10 @@ def main(args, resume_preempt=False):
     r_file = cfgs_meta.get("resume_checkpoint", None)
     p_file = cfgs_meta.get("pretrain_checkpoint", None)
     load_predictor = cfgs_meta.get("load_predictor", False)
+    predictor_checkpoint = cfgs_meta.get("predictor_checkpoint", None)
+    predictor_key = cfgs_meta.get("predictor_key", "predictor")
+    predictor_init_mode = cfgs_meta.get("predictor_init_mode", "strict")
+    predictor_min_matched = cfgs_meta.get("predictor_min_matched", 1)
     context_encoder_key = cfgs_meta.get("context_encoder_key", "encoder")
     target_encoder_key = cfgs_meta.get("target_encoder_key", "target_encoder")
     load_encoder = cfgs_meta.get("load_encoder", True)
@@ -370,6 +374,10 @@ def main(args, resume_preempt=False):
         target_encoder_key=target_encoder_key,
         target_encoder=target_encoder,
         load_predictor=load_predictor,
+        predictor_checkpoint=predictor_checkpoint,
+        predictor_key=predictor_key,
+        predictor_init_mode=predictor_init_mode,
+        predictor_min_matched=predictor_min_matched,
         load_encoder=load_encoder,
     )
 

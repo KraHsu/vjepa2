@@ -14,8 +14,17 @@ meta:
   # vitg.pt is a pure pretraining checkpoint; encoder key is "encoder" or "target_encoder"
   context_encoder_key: target_encoder
   target_encoder_key: target_encoder
-  # No AC predictor in base checkpoint, always train from scratch
+  # Predictor initialization:
+  # - keep load_predictor=false to train the AC predictor from scratch.
+  # - set load_predictor=true with predictor_checkpoint pointing at an AC
+  #   checkpoint to reuse matching predictor weights. If action_embed_dim differs
+  #   from the checkpoint, use predictor_init_mode=shape_safe so action/state
+  #   encoders stay randomly initialized while transformer/projection weights load.
   load_predictor: false
+  # predictor_checkpoint: /mnt/cpfs/zch/vjepa2_pretrain/vjepa2-ac-vitg.pt
+  predictor_key: predictor
+  predictor_init_mode: shape_safe  # strict | shape_safe
+  predictor_min_matched: 200
   load_encoder: true
   use_sdpa: true
   sync_gc: true

@@ -71,6 +71,48 @@ def _load_into(name, ddp_or_module, state, epoch):
     )
 
 
+def _load_into_shape_safe(name, ddp_or_module, state, epoch, *, min_matched=1):
+    """Load only checkpoint tensors that exist in the destination with the same shape."""
+    raw = _unwrap(ddp_or_module)
+    stripped = _strip_pretrain_prefixes(state)
+    dst = raw.state_dict()
+    loadable = {}
+    skipped_missing = []
+    skipped_shape = []
+    for k, v in stripped.items():
+        if k not in dst:
+            skipped_missing.append(k)
+            continue
+        if dst[k].shape != v.shape:
+            skipped_shape.append((k, tuple(v.shape), tuple(dst[k].shape)))
+            continue
+        loadable[k] = v
+
+    if len(loadable) < min_matched:
+        sample_shape = skipped_shape[:3]
+        sample_missing = skipped_missing[:3]
+        raise RuntimeError(
+            f"load_pretrained({name}): only {len(loadable)} same-shape keys matched "
+            f"but min_matched={min_matched}.\n"
+            f"  shape-mismatch sample: {sample_shape}\n"
+            f"  missing-key sample: {sample_missing}"
+        )
+
+    msg = raw.load_state_dict(loadable, strict=False)
+    logger.info(
+        f"loaded shape-safe pretrained {name} from epoch {epoch}: "
+        f"loaded={len(loadable)}/{len(dst)}, "
+        f"missing_after_load={len(msg.missing_keys)}, "
+        f"unexpected_after_load={len(msg.unexpected_keys)}, "
+        f"skipped_missing={len(skipped_missing)}, skipped_shape={len(skipped_shape)}"
+    )
+    if skipped_shape:
+        logger.info(
+            f"shape-safe {name} skipped shape-mismatched keys sample: "
+            f"{skipped_shape[:8]}"
+        )
+
+
 def load_pretrained(
     r_path,
     encoder=None,
@@ -79,6 +121,10 @@ def load_pretrained(
     context_encoder_key="encoder",
     target_encoder_key="target_encoder",
     load_predictor=False,
+    predictor_checkpoint=None,
+    predictor_key="predictor",
+    predictor_init_mode="strict",
+    predictor_min_matched=1,
     load_encoder=True,
 ):
     logger.info(f"Loading pretrained model from {r_path}")
@@ -89,7 +135,39 @@ def load_pretrained(
         _load_into("encoder", encoder, checkpoint[context_encoder_key], epoch)
 
     if load_predictor:
-        _load_into("predictor", predictor, checkpoint["predictor"], epoch)
+        predictor_source = checkpoint
+        predictor_epoch = epoch
+        if predictor_checkpoint is not None:
+            logger.info(f"Loading pretrained predictor from {predictor_checkpoint}")
+            predictor_source = robust_checkpoint_loader(
+                predictor_checkpoint, map_location=torch.device("cpu")
+            )
+            predictor_epoch = predictor_source.get("epoch", "unknown")
+
+        if predictor_key not in predictor_source:
+            raise KeyError(
+                f"Predictor key '{predictor_key}' not found in checkpoint. "
+                f"Available keys: {list(predictor_source.keys())}"
+            )
+
+        if predictor_init_mode == "strict":
+            _load_into("predictor", predictor, predictor_source[predictor_key], predictor_epoch)
+        elif predictor_init_mode == "shape_safe":
+            _load_into_shape_safe(
+                "predictor",
+                predictor,
+                predictor_source[predictor_key],
+                predictor_epoch,
+                min_matched=int(predictor_min_matched),
+            )
+        else:
+            raise ValueError(
+                "Unsupported predictor_init_mode="
+                f"{predictor_init_mode!r}; expected 'strict' or 'shape_safe'"
+            )
+
+        if predictor_source is not checkpoint:
+            del predictor_source
 
     if load_encoder and target_encoder is not None:
         _load_into("target_encoder", target_encoder, checkpoint[target_encoder_key], epoch)
